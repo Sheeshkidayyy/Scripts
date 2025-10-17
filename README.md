@@ -8,4 +8,4 @@ Open PowerShell as Administrator
 Paste the Script
 
 ## Step 3:
-Click enter and watch the points rain in!
+Press enter and watch the points rain in!
