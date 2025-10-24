@@ -5,7 +5,7 @@ Chose your operating system or distrobution (Ex: Windows 11, Windows Server, Ubu
 Look at the README that is named with what operating system you will be using in the Virtual enviorment.
 
 ## Next:
-Follow the instructions on teh README
+Follow the instructions on the README
 
 # Fianlly:
 BOOM you should have gotten some points!
