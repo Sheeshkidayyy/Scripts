@@ -1,5 +1,5 @@
 # Security Script
-A script for miscellaneous changes to a windows 11 pc, to get points in a Virtual Machine Enviorment
+A script for miscellaneous changes to a Windows 11 pc, to get points in a Virtual Machine Environment
 
 ## Step 1:
 Open PowerShell as Administrator
