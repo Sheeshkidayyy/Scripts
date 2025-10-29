@@ -27,7 +27,7 @@ if sudo rpi-update --dry-run | grep "would be updated"; then
   sudo rpi-update -y
   reboot_required=true
 else
-  echo "✅ Firmware already up to date."
+  echo "Firmware already up to date."
 fi
 
 # 3. Pi-hole updates
@@ -46,16 +46,19 @@ echo "Restarting DNS resolver..."
 pihole restartdns reload-lists
 
 # 6. Cleanup
-echo "🧹 Cleaning unused packages..."
+echo "Cleaning unused packages..."
 sudo apt autoremove -y
 sudo apt autoclean -y
 
-# 7. Finally, check if a reboot is needed
+# 7 Show Pi-hole status no matter what
+pihole status
+
+# 8. Then finally checks if a reboot is needed
 if [ "$reboot_required" = true ]; then
-  echo "🔁 Updates applied — rebooting in 10 seconds..."
-  sleep 10
+  echo "Updates applied — rebooting in 10 seconds..."
+  sleep 15
   sudo reboot now
 else
-  echo "✅ No updates detected — no reboot required."
-  pihole status
+  echo "No updates detected — no reboot required."
 fi
+
