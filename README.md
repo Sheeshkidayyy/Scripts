@@ -8,4 +8,4 @@ Look at the README that is named with what operating system you will be using in
 Follow the instructions on the README
 
 # Finally:
-BOOM you should have gotten some points!
+BOOM it should have helped you a bunch!
