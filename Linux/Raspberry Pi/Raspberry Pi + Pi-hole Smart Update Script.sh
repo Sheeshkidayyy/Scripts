@@ -32,7 +32,7 @@ echo "Gravity/Blocklists refreshed."
 
 # 6. Flush DNS cache
 echo "Restarting DNS resolver..."
-pihole restartdns reload-lists
+pihole reloaddns
 
 # 7. Cleanup
 echo "Cleaning unused packages..."
