@@ -48,5 +48,5 @@ if [[ "$confirm" =~ ^[Yy]$ ]]; then
   echo "Rebooting now..."
   sudo reboot now
 else
-  echo "No reboot will be performed. Please remember to reboot manually if necessary."
+  echo "No reboot will be performed."
 fi
