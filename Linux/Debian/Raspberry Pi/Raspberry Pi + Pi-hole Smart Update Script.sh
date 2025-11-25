@@ -35,9 +35,10 @@ echo "Restarting DNS resolver..."
 pihole reloaddns
 
 # 7. Cleanup
-echo "Cleaning unused packages..."
+echo "Cleaning and reconfiguring unused packages..."
 sudo apt autoremove -y
 sudo apt autoclean -y
+sudo dpkg --configure -a
 
 # 8 Show Pi-hole status no matter what
 pihole status
