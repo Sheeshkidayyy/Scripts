@@ -1,4 +1,5 @@
 # CYPat Enforcer - Full Security & Audit Script (Success-only audit for Logon/Logoff + Credential Validation Failures + Remote Assistance disabled + Defender enabled + FTP disabled + classic Windows Update + LimitBlankPasswordUse)
+# Made by Sheeshkidayyy github.com/sheeshkidayyy Also know as Sheesh
 $Apply = $true
 $AutoYes = $true
 $VerbosePreference = "Continue"
