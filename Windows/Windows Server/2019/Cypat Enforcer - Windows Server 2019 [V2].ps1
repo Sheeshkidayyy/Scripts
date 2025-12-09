@@ -1,4 +1,5 @@
 # CYPat Enforcer - Windows Server 2019 Full Security & All-Audit Policies
+# Made by Sheeshkidayyy github.com/sheeshkidayyy Also know as Sheesh
 $Apply = $true
 $AutoYes = $true
 $VerbosePreference = "Continue"
@@ -320,5 +321,6 @@ Force-Action "Disable SMB v1 protocol" {
         Write-Warning "Failed to disable SMB v1: $_"
     }
 }
+
 
 Write-Host "CYPat Enforcer finished. All security policies and advanced audit policies attempted." -ForegroundColor Green
