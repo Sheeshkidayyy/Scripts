@@ -1,4 +1,4 @@
-Security Script
+# Security Script
 A script for miscellaneous changes to a Windows server 2019 pc, to get points in a Virtual Machine Environment
 
 Step 1:
