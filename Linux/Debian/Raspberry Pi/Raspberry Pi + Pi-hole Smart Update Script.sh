@@ -16,34 +16,29 @@ echo "Checking for APT updates..."
 sudo apt update
 sudo apt full-upgrade -y
 
-# 3. Firmware (kernel, bootloader)
-echo "Checking firmware updates..."
-sudo apt upgrade raspberrypi-bootloader raspberrypi-kernel -y
-echo "Firmware check/update complete."
-
-# 4. Pi-hole updates
+# 3. Pi-hole updates
 echo "Updating Pi-hole core..."
 sudo pihole -up
 
-# 5. Gravity lists
+# 4. Gravity lists
 echo "Updating Pi-hole blocklists..."
 pihole -g
 echo "Gravity/Blocklists refreshed."
 
-# 6. Flush DNS cache
+# 5. Flush DNS cache
 echo "Restarting DNS resolver..."
 pihole reloaddns
 
-# 7. Cleanup
+# 6. Cleanup
 echo "Cleaning and reconfiguring unused packages..."
 sudo apt autoremove -y
 sudo apt autoclean -y
 sudo dpkg --configure -a
 
-# 8 Show Pi-hole status no matter what
+# 7 Show Pi-hole status no matter what
 pihole status
 
-# 9. Ask if reboot is needed
+# 8. Ask if reboot is needed
 read -p "Would you like to reboot now? (y/N): " confirm
 if [[ "$confirm" =~ ^[Yy]$ ]]; then
   echo "Rebooting now..."
