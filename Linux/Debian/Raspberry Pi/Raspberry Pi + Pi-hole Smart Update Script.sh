@@ -1,6 +1,7 @@
 #!/bin/bash
 # ==========================================
 # Raspberry Pi + Pi-hole Smart Update Script
+# Made by Sheeshkidayyy github.com/sheeshkidayyy Also know as Sheesh
 # ==========================================
 
 echo "Starting full system update..."
