@@ -1,4 +1,4 @@
-# CYPat Enforcer - Windows Server 2019 Full Security & All-Audit Policies
+# CYPat Enforcer - Windows Server 2019 Full Security & All-Audit Policies [V3] BIG BOY
 # Made by Sheeshkidayyy github.com/sheeshkidayyy Also know as Sheesh
 $Apply = $true
 $AutoYes = $true
@@ -669,6 +669,7 @@ function Find-ProhibitedFiles {
 }
 
 Write-Host "CYPat Enforcer finished. All security policies and advanced audit policies attempted." -ForegroundColor Green
+
 
 
 
