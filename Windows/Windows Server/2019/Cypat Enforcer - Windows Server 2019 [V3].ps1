@@ -490,48 +490,7 @@ Force-Action "Cleanse Hosts File & Disable Remote Assistance" {
     }
 }
 
- 
-# --- 25) Massive Prohibited File Hunter (C:\Users Only) ---
-function Find-ProhibitedFiles {
-    Write-Host "`n--- STARTING DEEP SCAN FOR MEDIA & SCRIPTS ---" -ForegroundColor Magenta
-    Write-Host "Location: C:\Users (Scanning Desktop, Downloads, and Documents)" -ForegroundColor Gray
-    
-    # Expanded Categories
-    $videoExt  = @("*.mp4", "*.avi", "*.mov", "*.mkv", "*.wmv", "*.flv", "*.mpg", "*.mpeg")
-    $audioExt  = @("*.mp3", "*.wav", "*.m4a", "*.flac", "*.aac", "*.ogg")
-    $scriptExt = @("*.ps1", "*.bat", "*.vbs", "*.py", "*.sh", "*.pl", "*.js", "*.php")
-    $imageExt  = @("*.jpg", "*.jpeg", "*.png", "*.gif", "*.bmp", "*.tiff")
-
-    $allExt = $videoExt + $audioExt + $scriptExt + $imageExt
-    
-    # Recursive scan of the Users directory
-    $foundFiles = Get-ChildItem -Path "C:\Users" -Include $allExt -Recurse -File -ErrorAction SilentlyContinue
-
-    if ($foundFiles) {
-        foreach ($file in $foundFiles) {
-            $path = $file.FullName
-            $ext = $file.Extension.ToLower()
-
-            # Color-coded reporting
-            if ($scriptExt -contains "*$ext") {
-                Write-Host "[POTENTIAL HACK TOOL/SCRIPT] $path" -ForegroundColor Red
-            } elseif ($videoExt -contains "*$ext" -or $audioExt -contains "*$ext") {
-                Write-Host "[PROHIBITED MEDIA FOUND]    $path" -ForegroundColor Yellow
-            } else {
-                Write-Host "[IMAGE/PHOTO DETECTED]      $path" -ForegroundColor Cyan
-            }
-        }
-        Write-Host "`nSearch Complete. Check the paths above." -ForegroundColor Magenta
-        Write-Host "CRITICAL: Do NOT delete files unless you are 100% sure they are prohibited." -ForegroundColor White
-    } else {
-        Write-Host "No suspicious files detected in C:\Users." -ForegroundColor Green
-    }
-}
-
-# Run the hunter at the end of the script
-if ($Apply) { Find-ProhibitedFiles }
-
-# --- BITLOCKER CHECK & REMINDER ---
+# --- 25) BITLOCKER CHECK & REMINDER ---
 Write-Host "`n--- BITLOCKER STATUS CHECK ---" -ForegroundColor Cyan
 Try {
     $bitlockerFeature = Get-WindowsFeature -Name BitLocker -ErrorAction SilentlyContinue
@@ -559,7 +518,158 @@ Try {
     Write-Warning "Unable to check BitLocker status: $_"
 }
 
+function Find-ProhibitedFiles {
+    <#
+    Non-destructive scan for many media, document, archive, script and executable extensions.
+    - Default scans common locations on all filesystem drives (Users, ProgramData, Program Files, Program Files (x86), and root).
+    - You can override ScanRoots or pass ExtraPaths to add locations.
+    - This function DOES NOT move/copy/delete files. It only reports and logs full file paths.
+    #>
+
+    param(
+        [string[]]$ScanRoots = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null } | ForEach-Object { $_.Root }),
+        [string[]]$ExtraPaths = @(),
+        [string[]]$ExcludePaths = @(${env:SystemRoot}, $env:ProgramFiles, ${env:ProgramFiles(x86)})
+    )
+
+    Write-Host "`n--- STARTING EXPANDED DEEP SCAN FOR MEDIA, SCRIPTS & EXECUTABLES (READ-ONLY) ---" -ForegroundColor Magenta
+    Write-Host "Default scan roots: $($ScanRoots -join ', ')" -ForegroundColor Gray
+
+    # Categories (extensions WITHOUT leading dot)
+    $videoExt   = @("mp4","avi","mov","mkv","wmv","flv","mpg","mpeg","m4v","webm","3gp","3g2","ts","m2ts","ogv","vob")
+    $audioExt   = @("mp3","wav","m4a","flac","aac","ogg","wma","aiff","alac","opus")
+    $scriptExt  = @("ps1","psm1","bat","cmd","vbs","vbe","js","jse","wsf","wsh","py","pl","rb","php","sh","psd1")
+    $imageExt   = @("jpg","jpeg","png","gif","bmp","tiff","svg","webp","heic")
+    $archiveExt = @("zip","rar","7z","tar","gz","bz2","xz","iso","msi")
+    $documentExt= @("doc","docx","xls","xlsx","ppt","pptx","pdf","odt","ods","odp","rtf","txt","csv","md","tex")
+    $exeExt     = @("exe","dll","bin","com","msi","scr","sys")  # executables / binaries
+
+    $allExtensions = ($videoExt + $audioExt + $scriptExt + $imageExt + $archiveExt + $documentExt + $exeExt) | Sort-Object -Unique
+
+    # Build scan path list
+    $scanPaths = [System.Collections.Generic.List[string]]::new()
+    foreach ($root in $ScanRoots) {
+        if (-not $root) { continue }
+        $candidates = @(
+            (Join-Path $root "Users"),
+            (Join-Path $root "ProgramData"),
+            (Join-Path $root "Program Files"),
+            (Join-Path $root "Program Files (x86)"),
+            $root.TrimEnd('\')  # root (e.g., C:\)
+        ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+        foreach ($p in $candidates) {
+            $scanPaths.Add($p)
+        }
+    }
+
+    foreach ($p in $ExtraPaths) { if ($p -and (Test-Path $p)) { $scanPaths.Add($p) } }
+
+    # Apply exclusions (case-insensitive startswith)
+    $scanPaths = $scanPaths | Where-Object {
+        $exclude = $false
+        foreach ($ex in $ExcludePaths) {
+            if (-not $ex) { continue }
+            if ($_.StartsWith($ex, [System.StringComparison]::InvariantCultureIgnoreCase)) { $exclude = $true; break }
+        }
+        -not $exclude
+    } | Select-Object -Unique
+
+    if (-not $scanPaths -or $scanPaths.Count -eq 0) {
+        Write-Host "No valid scan paths found after applying excludes. Exiting." -ForegroundColor Yellow
+        return
+    }
+
+    $reportFile = Join-Path $env:TEMP "cypat_prohibited_scan_report.txt"
+    # Overwrite report header for each run
+    Set-Content -Path $reportFile -Value ("Prohibited file scan report - {0}`nScan started: {1}`n" -f (Get-Date -Format o), (Get-Date)) -Encoding UTF8
+    Add-Content -Path $reportFile -Value ("Scan paths: {0}`nPatterns: {1}`nResults:`n" -f ($scanPaths -join ', '), ($allExtensions -join ', '))
+
+    # Counters
+    $counts = [ordered]@{
+        Scripts = 0
+        Media = 0
+        Images = 0
+        Archives = 0
+        Documents = 0
+        Executables = 0
+        Other = 0
+        Errors = 0
+    }
+
+    foreach ($rootPath in $scanPaths) {
+        Write-Host "`nScanning: $rootPath" -ForegroundColor Cyan
+        try {
+            $items = Get-ChildItem -Path $rootPath -Recurse -File -ErrorAction SilentlyContinue
+            if (-not $items) { continue }
+
+            foreach ($file in $items) {
+                try {
+                    $extNoDot = $file.Extension.TrimStart('.').ToLower()
+                    if ([string]::IsNullOrEmpty($extNoDot)) { continue }
+
+                    if ($scriptExt -contains $extNoDot) {
+                        Write-Host "[POTENTIAL SCRIPT] $($file.FullName)" -ForegroundColor Red
+                        Add-Content -Path $reportFile -Value ("[SCRIPT] {0}" -f $file.FullName)
+                        $counts.Scripts++
+                    }
+                    elseif ($videoExt -contains $extNoDot -or $audioExt -contains $extNoDot) {
+                        Write-Host "[MEDIA] $($file.FullName)" -ForegroundColor Yellow
+                        Add-Content -Path $reportFile -Value ("[MEDIA] {0}" -f $file.FullName)
+                        $counts.Media++
+                    }
+                    elseif ($imageExt -contains $extNoDot) {
+                        Write-Host "[IMAGE] $($file.FullName)" -ForegroundColor Cyan
+                        Add-Content -Path $reportFile -Value ("[IMAGE] {0}" -f $file.FullName)
+                        $counts.Images++
+                    }
+                    elseif ($archiveExt -contains $extNoDot) {
+                        Write-Host "[ARCHIVE] $($file.FullName)" -ForegroundColor Magenta
+                        Add-Content -Path $reportFile -Value ("[ARCHIVE] {0}" -f $file.FullName)
+                        $counts.Archives++
+                    }
+                    elseif ($documentExt -contains $extNoDot) {
+                        Write-Host "[DOCUMENT] $($file.FullName)" -ForegroundColor Gray
+                        Add-Content -Path $reportFile -Value ("[DOCUMENT] {0}" -f $file.FullName)
+                        $counts.Documents++
+                    }
+                    elseif ($exeExt -contains $extNoDot) {
+                        Write-Host "[EXECUTABLE] $($file.FullName)" -ForegroundColor DarkRed
+                        Add-Content -Path $reportFile -Value ("[EXECUTABLE] {0}" -f $file.FullName)
+                        $counts.Executables++
+                    }
+                    elseif ($allExtensions -contains $extNoDot) {
+                        Write-Host "[OTHER MATCH] $($file.FullName)" -ForegroundColor White
+                        Add-Content -Path $reportFile -Value ("[OTHER] {0}" -f $file.FullName)
+                        $counts.Other++
+                    }
+                } catch {
+                    $counts.Errors++
+                    $msg = ("Error processing file {0}: {1}" -f $file.FullName, $_.Exception.Message)
+                    Add-Content -Path $reportFile -Value $msg
+                }
+            }
+        } catch {
+            Write-Warning "Failed to recursively enumerate $rootPath : $_"
+            Add-Content -Path $reportFile -Value ("Failed to enumerate path {0}: {1}" -f $rootPath, $_.Exception.Message)
+        }
+    }
+
+    # Summary
+    Add-Content -Path $reportFile -Value "`nSummary:`n"
+    foreach ($k in $counts.Keys) {
+        $line = "{0,-12} : {1}" -f $k, $counts[$k]
+        Add-Content -Path $reportFile -Value $line
+    }
+
+    Write-Host "`nSearch Complete. Summary:" -ForegroundColor Magenta
+    $counts.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12} : {1}" -f $_.Name, $_.Value) }
+    Write-Host "Full report saved to: $reportFile" -ForegroundColor Green
+    Write-Host "CRITICAL: Do NOT delete files unless you are 100% sure they are prohibited." -ForegroundColor White
+}
+
 Write-Host "CYPat Enforcer finished. All security policies and advanced audit policies attempted." -ForegroundColor Green
+
 
 
 
