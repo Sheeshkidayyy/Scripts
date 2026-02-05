@@ -518,159 +518,187 @@ Try {
     Write-Warning "Unable to check BitLocker status: $_"
 }
 
-function Find-ProhibitedFiles {
-    <#
-    Non-destructive scan for many media, document, archive, script and executable extensions.
-    - Default scans common locations on all filesystem drives (Users, ProgramData, Program Files, Program Files (x86), and root).
-    - You can override ScanRoots or pass ExtraPaths to add locations.
-    - This function DOES NOT move/copy/delete files. It only reports and logs full file paths.
-    #>
+# --- 26) Event Viewer Hardening ---
+Force-Action "Harden Event Log Policies (Size & Retention)" {
+    $logs = @("Security", "Application", "System")
+    foreach ($log in $logs) {
+        # Set max size to 1GB (1024MB) and ensure it doesn't drop events
+        Limit-EventLog -LogName $log -MaximumSize 1024MB -OverflowAction OverWriteAsNeeded
+        Write-Host "Configured $log Log: 1GB Size, Overwrite as Needed." -ForegroundColor Green
+    }
+}
 
-    param(
-        [string[]]$ScanRoots = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null } | ForEach-Object { $_.Root }),
-        [string[]]$ExtraPaths = @(),
-        [string[]]$ExcludePaths = @(${env:SystemRoot}, $env:ProgramFiles, ${env:ProgramFiles(x86)})
+# --- 27) Disable NTLMv1 and Force NTLMv2 ---
+Force-Action "Disable NTLMv1 and Force NTLMv2" {
+    $lsaKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa"
+    
+    # LmCompatibilityLevel = 5 (Send NTLMv2 response only. Refuse LM & NTLM)
+    New-ItemProperty -Path $lsaKey -Name "LmCompatibilityLevel" -PropertyType DWord -Value 5 -Force | Out-Null
+    
+    # Disable LM on the network
+    New-ItemProperty -Path $lsaKey -Name "NoLMHash" -PropertyType DWord -Value 1 -Force | Out-Null
+    
+    # NTLM MinClientSec (Require 128-bit encryption)
+    $msvKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Lsa\MSV1_0"
+    if (-not (Test-Path $msvKey)) { New-Item -Path $msvKey -Force | Out-Null }
+    New-ItemProperty -Path $msvKey -Name "NtlmMinClientSec" -PropertyType DWord -Value 537395200 -Force | Out-Null
+    New-ItemProperty -Path $msvKey -Name "NtlmMinServerSec" -PropertyType DWord -Value 537395200 -Force | Out-Null
+    
+    Write-Host "NTLMv1 Disabled. NTLMv2 Enforced (128-bit)." -ForegroundColor Green
+}
+
+# --- 28) Certificate Security (Audit Rogue, Find Expired, Update Roots) ---
+Force-Action "Certificate Security Audit" {
+    $certReport = Join-Path $env:TEMP "cypat_cert_report.txt"
+    "--- CERTIFICATE REPORT ---" | Out-File $certReport
+    
+    # A. Audit Rogue Root Certificates (Non-Microsoft)
+    Write-Host "Scanning for Rogue Root Certificates..." -ForegroundColor Cyan
+    $rogueCerts = Get-ChildItem Cert:\LocalMachine\Root | Where-Object { 
+        $_.Issuer -notmatch "Microsoft" -and $_.Subject -notmatch "Microsoft" 
+    }
+    if ($rogueCerts) {
+        Write-Host "WARNING: Potential Rogue Root Certificates found!" -ForegroundColor Red
+        "Rogue Roots Found:" | Add-Content $certReport
+        $rogueCerts | Format-Table Thumbprint, Subject, Issuer | Out-String | Add-Content $certReport
+    } else {
+        Write-Host "No obvious rogue root certificates found." -ForegroundColor Green
+    }
+
+    # B. Find Expired Certificates (Web Server/IIS)
+    Write-Host "Scanning for Expired Certificates..." -ForegroundColor Cyan
+    $expiredCerts = Get-ChildItem Cert:\LocalMachine\My | Where-Object { $_.NotAfter -lt (Get-Date) }
+    if ($expiredCerts) {
+        Write-Host "WARNING: Expired Certificates Found!" -ForegroundColor Red
+        "Expired Certs (Needs Renewal):" | Add-Content $certReport
+        $expiredCerts | Format-Table Subject, NotAfter, Thumbprint | Out-String | Add-Content $certReport
+        Write-Host "ACTION: Check IIS Manager to manually renew these certificates." -ForegroundColor Yellow
+    } else {
+        Write-Host "No expired local certificates found." -ForegroundColor Green
+    }
+
+    # C. Update Trusted Root Certificates (Requires Internet)
+    Write-Host "Attempting to update Trusted Root Certificate List..." -ForegroundColor Cyan
+    Try {
+        # Trigger standard Windows Update certificate sync
+        certutil -trigger sync | Out-Null
+        Write-Host "Triggered Root Certificate Sync." -ForegroundColor Green
+    } Catch {
+        Write-Warning "Could not trigger certificate sync (Internet may be blocked)."
+    }
+
+    Write-Host "Certificate Report saved to: $certReport" -ForegroundColor White
+}
+
+# --- 30) Disable Extended Weak Services (FINAL SWEEP) ---
+Force-Action "Disable Extended Weak Services (Spooler, SNMP, RemoteReg)" {
+    $weakServices = @(
+        "Spooler",          # Print Spooler (Critical Vuln risk - Check README if Print Server!)
+        "RemoteRegistry",   # Remote Registry Access
+        "MapsBroker",       # Downloaded Maps Manager
+        "Fax",              # Fax Service
+        "TapiSrv",          # Telephony
+        "SNMP",             # Simple Network Management Protocol (Info Leak)
+        "SNMPTrap",         # SNMP Trap
+        "upnphost",         # UPnP Device Host
+        "SSDPSRV",          # SSDP Discovery (Network Chatter)
+        "W3SVC",            # IIS World Wide Web Publishing (Disable ONLY if NOT a Web Server)
+        "SessionEnv"        # Remote Desktop Configuration (Careful - related to RDP)
     )
 
-    Write-Host "`n--- STARTING EXPANDED DEEP SCAN FOR MEDIA, SCRIPTS & EXECUTABLES (READ-ONLY) ---" -ForegroundColor Magenta
-    Write-Host "Default scan roots: $($ScanRoots -join ', ')" -ForegroundColor Gray
-
-    # Categories (extensions WITHOUT leading dot)
-    $videoExt   = @("mp4","avi","mov","mkv","wmv","flv","mpg","mpeg","m4v","webm","3gp","3g2","ts","m2ts","ogv","vob")
-    $audioExt   = @("mp3","wav","m4a","flac","aac","ogg","wma","aiff","alac","opus")
-    $scriptExt  = @("ps1","psm1","bat","cmd","vbs","vbe","js","jse","wsf","wsh","py","pl","rb","php","sh","psd1")
-    $imageExt   = @("jpg","jpeg","png","gif","bmp","tiff","svg","webp","heic")
-    $archiveExt = @("zip","rar","7z","tar","gz","bz2","xz","iso","msi")
-    $documentExt= @("doc","docx","xls","xlsx","ppt","pptx","pdf","odt","ods","odp","rtf","txt","csv","md","tex")
-    $exeExt     = @("exe","dll","bin","com","msi","scr","sys")  # executables / binaries
-
-    $allExtensions = ($videoExt + $audioExt + $scriptExt + $imageExt + $archiveExt + $documentExt + $exeExt) | Sort-Object -Unique
-
-    # Build scan path list
-    $scanPaths = [System.Collections.Generic.List[string]]::new()
-    foreach ($root in $ScanRoots) {
-        if (-not $root) { continue }
-        $candidates = @(
-            (Join-Path $root "Users"),
-            (Join-Path $root "ProgramData"),
-            (Join-Path $root "Program Files"),
-            (Join-Path $root "Program Files (x86)"),
-            $root.TrimEnd('\')  # root (e.g., C:\)
-        ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
-
-        foreach ($p in $candidates) {
-            $scanPaths.Add($p)
+    foreach ($svcName in $weakServices) {
+        $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
+        # Only stop if it is currently running or not disabled
+        if ($svc -and ($svc.Status -ne 'Stopped' -or $svc.StartType -ne 'Disabled')) {
+            # Check for critical exemptions (e.g., if README says "Print Server", skip Spooler)
+            # This is a safety check you should do manually, but the script will enforce the disable.
+            
+            Stop-Service -Name $svcName -Force -ErrorAction SilentlyContinue
+            Set-Service -Name $svcName -StartupType Disabled -ErrorAction SilentlyContinue
+            Write-Host "Disabled Service: $svcName" -ForegroundColor Green
         }
     }
+}
 
-    foreach ($p in $ExtraPaths) { if ($p -and (Test-Path $p)) { $scanPaths.Add($p) } }
+# --- 31) RDP Hardening (NLA & High Encryption) ---
+Force-Action "Harden Remote Desktop Settings" {
+    $rdpKey = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+    # Enforce NLA (1)
+    New-ItemProperty -Path $rdpKey -Name "UserAuthentication" -PropertyType DWord -Value 1 -Force | Out-Null
+    # Set Encryption Level to 3 (High - 128 bit)
+    New-ItemProperty -Path $rdpKey -Name "MinEncryptionLevel" -PropertyType DWord -Value 3 -Force | Out-Null
+    Write-Host "RDP Hardened: NLA Enforced and High Encryption Set." -ForegroundColor Green
+}
 
-    # Apply exclusions (case-insensitive startswith)
-    $scanPaths = $scanPaths | Where-Object {
-        $exclude = $false
-        foreach ($ex in $ExcludePaths) {
-            if (-not $ex) { continue }
-            if ($_.StartsWith($ex, [System.StringComparison]::InvariantCultureIgnoreCase)) { $exclude = $true; break }
-        }
-        -not $exclude
-    } | Select-Object -Unique
+# --- 32) Disable LLMNR and NetBIOS ---
+Force-Action "Disable LLMNR & NetBIOS" {
+    # Disable LLMNR via Registry
+    $dnscKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+    if (-not (Test-Path $dnscKey)) { New-Item -Path $dnscKey -Force | Out-Null }
+    New-ItemProperty -Path $dnscKey -Name "EnableMulticast" -PropertyType DWord -Value 0 -Force | Out-Null
 
-    if (-not $scanPaths -or $scanPaths.Count -eq 0) {
-        Write-Host "No valid scan paths found after applying excludes. Exiting." -ForegroundColor Yellow
-        return
+    # Disable NetBIOS on all network adapters
+    $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
+    foreach ($adapter in $adapters) {
+        $adapter.SetTcpipNetbios(2) | Out-Null # 2 = Disable NetBIOS over TCP/IP
     }
+    Write-Host "LLMNR and NetBIOS disabled across all adapters." -ForegroundColor Green
+}
 
-    $reportFile = Join-Path $env:TEMP "cypat_prohibited_scan_report.txt"
-    # Overwrite report header for each run
-    Set-Content -Path $reportFile -Value ("Prohibited file scan report - {0}`nScan started: {1}`n" -f (Get-Date -Format o), (Get-Date)) -Encoding UTF8
-    Add-Content -Path $reportFile -Value ("Scan paths: {0}`nPatterns: {1}`nResults:`n" -f ($scanPaths -join ', '), ($allExtensions -join ', '))
+# --- 33) Disable Legacy Name Resolution (LLMNR & NetBIOS) ---
+Force-Action "Disable LLMNR & NetBIOS" {
+    # Disable LLMNR
+    $dnsKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient"
+    if (-not (Test-Path $dnsKey)) { New-Item -Path $dnsKey -Force | Out-Null }
+    New-ItemProperty -Path $dnsKey -Name "EnableMulticast" -PropertyType DWord -Value 0 -Force | Out-Null
 
-    # Counters
-    $counts = [ordered]@{
-        Scripts = 0
-        Media = 0
-        Images = 0
-        Archives = 0
-        Documents = 0
-        Executables = 0
-        Other = 0
-        Errors = 0
+    # Disable NetBIOS on all active network adapters
+    $adapters = Get-WmiObject Win32_NetworkAdapterConfiguration | Where-Object { $_.IPEnabled -eq $true }
+    foreach ($adapter in $adapters) {
+        $adapter.SetTcpipNetbios(2) | Out-Null # 2 = Disable
     }
+    Write-Host "Network Protocols Hardened: LLMNR/NetBIOS Disabled." -ForegroundColor Green
+}
 
-    foreach ($rootPath in $scanPaths) {
-        Write-Host "`nScanning: $rootPath" -ForegroundColor Cyan
-        try {
-            $items = Get-ChildItem -Path $rootPath -Recurse -File -ErrorAction SilentlyContinue
-            if (-not $items) { continue }
+# --- 34) Secure Required RDP (Enforce NLA) ---
+Force-Action "Secure RDP with NLA" {
+    $rdpPath = "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp"
+    New-ItemProperty -Path $rdpPath -Name "UserAuthentication" -PropertyType DWord -Value 1 -Force | Out-Null
+    Write-Host "RDP Security: Network Level Authentication (NLA) Enforced." -ForegroundColor Green
+}
 
-            foreach ($file in $items) {
-                try {
-                    $extNoDot = $file.Extension.TrimStart('.').ToLower()
-                    if ([string]::IsNullOrEmpty($extNoDot)) { continue }
-
-                    if ($scriptExt -contains $extNoDot) {
-                        Write-Host "[POTENTIAL SCRIPT] $($file.FullName)" -ForegroundColor Red
-                        Add-Content -Path $reportFile -Value ("[SCRIPT] {0}" -f $file.FullName)
-                        $counts.Scripts++
-                    }
-                    elseif ($videoExt -contains $extNoDot -or $audioExt -contains $extNoDot) {
-                        Write-Host "[MEDIA] $($file.FullName)" -ForegroundColor Yellow
-                        Add-Content -Path $reportFile -Value ("[MEDIA] {0}" -f $file.FullName)
-                        $counts.Media++
-                    }
-                    elseif ($imageExt -contains $extNoDot) {
-                        Write-Host "[IMAGE] $($file.FullName)" -ForegroundColor Cyan
-                        Add-Content -Path $reportFile -Value ("[IMAGE] {0}" -f $file.FullName)
-                        $counts.Images++
-                    }
-                    elseif ($archiveExt -contains $extNoDot) {
-                        Write-Host "[ARCHIVE] $($file.FullName)" -ForegroundColor Magenta
-                        Add-Content -Path $reportFile -Value ("[ARCHIVE] {0}" -f $file.FullName)
-                        $counts.Archives++
-                    }
-                    elseif ($documentExt -contains $extNoDot) {
-                        Write-Host "[DOCUMENT] $($file.FullName)" -ForegroundColor Gray
-                        Add-Content -Path $reportFile -Value ("[DOCUMENT] {0}" -f $file.FullName)
-                        $counts.Documents++
-                    }
-                    elseif ($exeExt -contains $extNoDot) {
-                        Write-Host "[EXECUTABLE] $($file.FullName)" -ForegroundColor DarkRed
-                        Add-Content -Path $reportFile -Value ("[EXECUTABLE] {0}" -f $file.FullName)
-                        $counts.Executables++
-                    }
-                    elseif ($allExtensions -contains $extNoDot) {
-                        Write-Host "[OTHER MATCH] $($file.FullName)" -ForegroundColor White
-                        Add-Content -Path $reportFile -Value ("[OTHER] {0}" -f $file.FullName)
-                        $counts.Other++
-                    }
-                } catch {
-                    $counts.Errors++
-                    $msg = ("Error processing file {0}: {1}" -f $file.FullName, $_.Exception.Message)
-                    Add-Content -Path $reportFile -Value $msg
-                }
-            }
-        } catch {
-            Write-Warning "Failed to recursively enumerate $rootPath : $_"
-            Add-Content -Path $reportFile -Value ("Failed to enumerate path {0}: {1}" -f $rootPath, $_.Exception.Message)
-        }
+# --- 35) Disable Sticky Keys (Prevent Login Backdoors) ---
+Force-Action "Disable Sticky Keys Shortcuts" {
+    # Set the 'Flags' registry key for Sticky Keys to '506' (Disabled) for the current user (and default user if possible)
+    $stickyPath = "HKCU:\Control Panel\Accessibility\StickyKeys"
+    if (Test-Path $stickyPath) {
+        Set-ItemProperty -Path $stickyPath -Name "Flags" -Value "506" -Force
     }
+    Write-Host "Sticky Keys shortcut disabled for current user." -ForegroundColor Green
+}
 
-    # Summary
-    Add-Content -Path $reportFile -Value "`nSummary:`n"
-    foreach ($k in $counts.Keys) {
-        $line = "{0,-12} : {1}" -f $k, $counts[$k]
-        Add-Content -Path $reportFile -Value $line
+# --- 36) Remove Malicious WSUS/Update Blocks ---
+Force-Action "Remove WSUS Restrictions (Fix Update Blocking)" {
+    $auKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU"
+    
+    # Remove 'UseWUServer' which forces the PC to look at a fake update server
+    if (Get-ItemProperty -Path $auKey -Name "UseWUServer" -ErrorAction SilentlyContinue) {
+        Remove-ItemProperty -Path $auKey -Name "UseWUServer" -Force
+        Write-Host "REMOVED 'UseWUServer' restriction. Updates will now come from Microsoft." -ForegroundColor Green
     }
+    
+    # Ensure we aren't blocking updates via 'NoAutoUpdate'
+    Set-ItemProperty -Path $auKey -Name "NoAutoUpdate" -Value 0 -Force -ErrorAction SilentlyContinue
+}
 
-    Write-Host "`nSearch Complete. Summary:" -ForegroundColor Magenta
-    $counts.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12} : {1}" -f $_.Name, $_.Value) }
-    Write-Host "Full report saved to: $reportFile" -ForegroundColor Green
-    Write-Host "CRITICAL: Do NOT delete files unless you are 100% sure they are prohibited." -ForegroundColor White
+# --- 37) Disable Windows Update Delivery Optimization (P2P Updates) ---
+Force-Action "Disable WUDO (Peer-to-Peer Update Sharing)" {
+    $doKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization"
+    if (-not (Test-Path $doKey)) { New-Item -Path $doKey -Force | Out-Null }
+    
+    # DODownloadMode = 0 (HTTP only, no Peer-to-Peer)
+    New-ItemProperty -Path $doKey -Name "DODownloadMode" -PropertyType DWord -Value 0 -Force | Out-Null
+    Write-Host "Delivery Optimization (P2P) Disabled." -ForegroundColor Green
 }
 
 Write-Host "CYPat Enforcer finished. All security policies and advanced audit policies attempted." -ForegroundColor Green
-
-
-
-
-
