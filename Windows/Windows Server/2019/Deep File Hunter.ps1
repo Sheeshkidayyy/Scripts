@@ -1,11 +1,12 @@
 <#
 .SYNOPSIS
-  Read-only deep scan for media, document, archive, script and executable files on Windows Server.
+  Read-only deep scan for media, document, archive, script and executable files on Windows Server 2019.
 
 .DESCRIPTION
-  Non-destructive scanner that enumerates common locations on all filesystem drives (Users, ProgramData,
-  Program Files, Program Files (x86), and the drive root) and logs any files matching a configurable set
-  of extensions. Does NOT modify, move, or delete files — it only reports them.
+  Non-destructive scanner that enumerates common locations on all filesystem drives and logs files by category:
+  - PROHIBITED: Files that should never exist (suspicious)
+  - ALLOWED: Files that are legitimate but tracked
+  - SYSTEM: Pre-installed Windows Server 2019 files (filtered by default)
 
 .PARAMETER ScanRoots
   Optional list of drive roots to scan (e.g., C:\, D:\). If omitted the script auto-discovers filesystem drives.
@@ -14,7 +15,7 @@
   Additional paths to include in the scan.
 
 .PARAMETER ExcludePaths
-  Paths to exclude (prefix-match, case-insensitive). Defaults to system folders.
+  Paths to exclude (prefix-match, case-insensitive).
 
 .PARAMETER ReportPath
   Path to the output report file. Defaults to $env:TEMP\cypat_prohibited_scan_report.txt
@@ -22,25 +23,105 @@
 .PARAMETER IncludeHidden
   Include hidden and system files/folders in enumeration.
 
+.PARAMETER IncludeSystemFiles
+  Include Windows Server 2019 system files in output (default is to filter them out).
+
 .PARAMETER Parallel
-  If supplied, will attempt parallel processing per-root using Start-Job for isolation. Use on machines with many cores.
+  If supplied, will attempt parallel processing per-root using Start-Job for isolation.
 
 .EXAMPLE
-  .\CYPat_DeepScan.ps1
-  Run default scan (auto-detect drives and default exclusions).
+  .\Deep_File_Hunter.ps1
+  Run default scan (excludes system files).
 
 .EXAMPLE
-  .\CYPat_DeepScan.ps1 -ScanRoots C:\,D:\ -ExtraPaths "E:\Shared" -ReportPath "C:\temp\scan.txt"
+  .\Deep_File_Hunter.ps1 -IncludeSystemFiles
+  Include system files in the output.
 #>
 
 param(
     [string[]]$ScanRoots,
     [string[]]$ExtraPaths = @(),
-    [string[]]$ExcludePaths = @($env:SystemRoot, $env:ProgramFiles, $env:'ProgramFiles(x86)'),
+    [string[]]$ExcludePaths = @(),
     [string]$ReportPath = (Join-Path $env:TEMP "cypat_prohibited_scan_report.txt"),
     [switch]$IncludeHidden,
+    [switch]$IncludeSystemFiles,
     [switch]$Parallel
 )
+
+function Get-SystemExclusionPaths {
+    <#
+    .SYNOPSIS
+      Returns Windows Server 2019 system directories to exclude.
+    #>
+    $exclusions = @(
+        $env:SystemRoot,
+        $env:ProgramFiles,
+        "${env:ProgramFiles(x86)}",
+        (Join-Path $env:SystemRoot "System32"),
+        (Join-Path $env:SystemRoot "SysWOW64"),
+        (Join-Path $env:SystemRoot "WinSxS"),
+        (Join-Path $env:SystemRoot "Temp"),
+        (Join-Path $env:SystemRoot "Prefetch"),
+        (Join-Path $env:SystemRoot "Tasks"),
+        (Join-Path $env:SystemRoot "inf"),
+        (Join-Path $env:SystemRoot "Fonts"),
+        (Join-Path $env:ProgramFiles "Windows Defender"),
+        (Join-Path $env:ProgramFiles "Internet Explorer"),
+        (Join-Path $env:ProgramFiles "Windows Mail"),
+        (Join-Path $env:ProgramFiles "Windows Media Player"),
+        (Join-Path $env:ProgramFiles "WindowsApps"),
+        "${env:ProgramFiles(x86)}\Internet Explorer",
+        "${env:ProgramFiles(x86)}\Windows Defender",
+        "C:\ProgramData\Microsoft",
+        "C:\ProgramData\Package Cache",
+        "C:\ProgramData\NVIDIA",
+        "C:\ProgramData\Intel",
+        "C:\ProgramData\AMD",
+        (Join-Path $env:SystemRoot "System Recovery"),
+        (Join-Path $env:SystemRoot "servicing"),
+        (Join-Path $env:SystemRoot "Panther"),
+        (Join-Path $env:SystemRoot "Downloaded Program Files")
+    )
+    
+    return $exclusions | Where-Object { $_ } | Select-Object -Unique | ForEach-Object { $_.TrimEnd('\') }
+}
+
+function Test-IsSystemPath {
+    <#
+    .SYNOPSIS
+      Tests if a file path is part of Windows Server 2019 default installation.
+    #>
+    param([string]$FilePath)
+    
+    $systemPaths = Get-SystemExclusionPaths
+    foreach ($sysPath in $systemPaths) {
+        if ($FilePath.StartsWith($sysPath, [System.StringComparison]::InvariantCultureIgnoreCase)) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-AllowedExtensions {
+    <#
+    .SYNOPSIS
+      Extensions that are allowed/normal in a business environment but still tracked.
+    #>
+    return @("doc","docx","xls","xlsx","ppt","pptx","pdf","odt","ods","odp","rtf","txt","csv","md")
+}
+
+function Get-ProhibitedExtensions {
+    <#
+    .SYNOPSIS
+      Extensions that are suspicious and should never exist on a server.
+    #>
+    return @("mp4","avi","mov","mkv","wmv","flv","mpg","mpeg","m4v","webm","3gp","3g2","ts","m2ts","ogv","vob",
+             "mp3","wav","m4a","flac","aac","ogg","wma","aiff","alac","opus",
+             "ps1","psm1","bat","cmd","vbs","vbe","js","jse","wsf","wsh","py","pl","rb","php","sh","psd1",
+             "jpg","jpeg","png","gif","bmp","tiff","svg","webp","heic",
+             "zip","rar","7z","tar","gz","bz2","xz","iso","msi",
+             "exe","dll","bin","com","scr")
+}
 
 function Find-ProhibitedFiles {
     param(
@@ -48,23 +129,17 @@ function Find-ProhibitedFiles {
         [string[]]$ExtraPathsParam,
         [string[]]$ExcludePathsParam,
         [string]$OutFile,
-        [switch]$IncludeHiddenParam
+        [switch]$IncludeHiddenParam,
+        [switch]$IncludeSystemFilesParam
     )
 
-    Write-Host "`n--- STARTING EXPANDED DEEP SCAN FOR MEDIA, SCRIPTS & EXECUTABLES (READ-ONLY) ---" -ForegroundColor Magenta
+    Write-Host "`n--- DEEP SCAN FOR SUSPICIOUS FILES ON WINDOWS SERVER 2019 ---" -ForegroundColor Magenta
 
-    # Extension categories (without leading dot)
-    $videoExt   = @("mp4","avi","mov","mkv","wmv","flv","mpg","mpeg","m4v","webm","3gp","3g2","ts","m2ts","ogv","vob")
-    $audioExt   = @("mp3","wav","m4a","flac","aac","ogg","wma","aiff","alac","opus")
-    $scriptExt  = @("ps1","psm1","bat","cmd","vbs","vbe","js","jse","wsf","wsh","py","pl","rb","php","sh","psd1")
-    $imageExt   = @("jpg","jpeg","png","gif","bmp","tiff","svg","webp","heic")
-    $archiveExt = @("zip","rar","7z","tar","gz","bz2","xz","iso","msi")
-    $documentExt= @("doc","docx","xls","xlsx","ppt","pptx","pdf","odt","ods","odp","rtf","txt","csv","md","tex")
-    $exeExt     = @("exe","dll","bin","com","msi","scr","sys")
+    $prohibitedExt = Get-ProhibitedExtensions
+    $allowedExt = Get-AllowedExtensions
+    $allTrackedExt = ($prohibitedExt + $allowedExt) | Sort-Object -Unique
 
-    $allExtensions = ($videoExt + $audioExt + $scriptExt + $imageExt + $archiveExt + $documentExt + $exeExt) | Sort-Object -Unique
-
-    # Build initial scan paths from roots
+    # Build scan paths
     $scanPaths = [System.Collections.Generic.List[string]]::new()
     foreach ($root in $ScanRootsParam) {
         if (-not $root) { continue }
@@ -81,7 +156,7 @@ function Find-ProhibitedFiles {
 
     foreach ($p in $ExtraPathsParam) { if ($p -and (Test-Path $p)) { $scanPaths.Add($p) } }
 
-    # Apply prefix-based exclusions (case-insensitive)
+    # Apply exclusions
     $scanPaths = $scanPaths | Where-Object {
         $exclude = $false
         foreach ($ex in $ExcludePathsParam) {
@@ -92,15 +167,26 @@ function Find-ProhibitedFiles {
     } | Select-Object -Unique
 
     if (-not $scanPaths -or $scanPaths.Count -eq 0) {
-        Write-Host "No valid scan paths found after applying excludes. Exiting." -ForegroundColor Yellow
+        Write-Host "No valid scan paths found. Exiting." -ForegroundColor Yellow
         return
     }
 
     # Initialize report
-    Set-Content -Path $OutFile -Value ("Prohibited file scan report - {0}`nScan started: {1}`n`nScan paths: {2}`nPatterns: {3}`nResults:`n" -f (Get-Date -Format o), (Get-Date), ($scanPaths -join ', '), ($allExtensions -join ', ')) -Encoding UTF8
+    $reportHeader = "Prohibited File Scan Report - {0}`nScan started: {1}`n" -f (Get-Date -Format o), (Get-Date)
+    if (-not $IncludeSystemFilesParam) {
+        $reportHeader += "Filtering: Windows Server 2019 system files excluded`n"
+    }
+    $reportHeader += "`nCategories:`n  PROHIBITED = Suspicious files (media, scripts, archives)`n  ALLOWED = Business files tracked for compliance`n  SYSTEM = Windows Server 2019 default files`n`nResults:`n"
+    
+    Set-Content -Path $OutFile -Value $reportHeader
 
     # Counters
-    $counts = [ordered]@{ Scripts=0; Media=0; Images=0; Archives=0; Documents=0; Executables=0; Other=0; Errors=0 }
+    $counts = [ordered]@{ 
+        Prohibited=0
+        Allowed=0
+        System=0
+        Errors=0
+    }
 
     foreach ($rootPath in $scanPaths) {
         Write-Host "`nScanning: $rootPath" -ForegroundColor Cyan
@@ -116,88 +202,91 @@ function Find-ProhibitedFiles {
                     $extNoDot = $file.Extension.TrimStart('.').ToLower()
                     if ([string]::IsNullOrEmpty($extNoDot)) { continue }
 
-                    if ($scriptExt -contains $extNoDot) {
-                        Write-Host "[POTENTIAL SCRIPT] $($file.FullName)" -ForegroundColor Red
-                        Add-Content -Path $OutFile -Value ("[SCRIPT] {0}" -f $file.FullName)
-                        $counts.Scripts++
+                    $isSystemFile = Test-IsSystemPath -FilePath $file.FullName
+
+                    if ($isSystemFile -and -not $IncludeSystemFilesParam) {
+                        # Skip system files unless requested
+                        continue
                     }
-                    elseif ($videoExt -contains $extNoDot -or $audioExt -contains $extNoDot) {
-                        Write-Host "[MEDIA] $($file.FullName)" -ForegroundColor Yellow
-                        Add-Content -Path $OutFile -Value ("[MEDIA] {0}" -f $file.FullName)
-                        $counts.Media++
+
+                    if ($prohibitedExt -contains $extNoDot) {
+                        if ($isSystemFile) {
+                            Write-Host "[SYSTEM-PROHIBITED] $($file.FullName)" -ForegroundColor DarkYellow
+                            Add-Content -Path $OutFile -Value ("[SYSTEM-PROHIBITED] {0}" -f $file.FullName)
+                            $counts.System++
+                        } else {
+                            Write-Host "[PROHIBITED] $($file.FullName)" -ForegroundColor Red
+                            Add-Content -Path $OutFile -Value ("[PROHIBITED] {0}" -f $file.FullName)
+                            $counts.Prohibited++
+                        }
                     }
-                    elseif ($imageExt -contains $extNoDot) {
-                        Write-Host "[IMAGE] $($file.FullName)" -ForegroundColor Cyan
-                        Add-Content -Path $OutFile -Value ("[IMAGE] {0}" -f $file.FullName)
-                        $counts.Images++
-                    }
-                    elseif ($archiveExt -contains $extNoDot) {
-                        Write-Host "[ARCHIVE] $($file.FullName)" -ForegroundColor Magenta
-                        Add-Content -Path $OutFile -Value ("[ARCHIVE] {0}" -f $file.FullName)
-                        $counts.Archives++
-                    }
-                    elseif ($documentExt -contains $extNoDot) {
-                        Write-Host "[DOCUMENT] $($file.FullName)" -ForegroundColor Gray
-                        Add-Content -Path $OutFile -Value ("[DOCUMENT] {0}" -f $file.FullName)
-                        $counts.Documents++
-                    }
-                    elseif ($exeExt -contains $extNoDot) {
-                        Write-Host "[EXECUTABLE] $($file.FullName)" -ForegroundColor DarkRed
-                        Add-Content -Path $OutFile -Value ("[EXECUTABLE] {0}" -f $file.FullName)
-                        $counts.Executables++
-                    }
-                    elseif ($allExtensions -contains $extNoDot) {
-                        Write-Host "[OTHER MATCH] $($file.FullName)" -ForegroundColor White
-                        Add-Content -Path $OutFile -Value ("[OTHER] {0}" -f $file.FullName)
-                        $counts.Other++
+                    elseif ($allowedExt -contains $extNoDot) {
+                        if ($isSystemFile) {
+                            Write-Host "[SYSTEM-ALLOWED] $($file.FullName)" -ForegroundColor DarkGreen
+                            Add-Content -Path $OutFile -Value ("[SYSTEM-ALLOWED] {0}" -f $file.FullName)
+                            $counts.System++
+                        } else {
+                            Write-Host "[ALLOWED] $($file.FullName)" -ForegroundColor Green
+                            Add-Content -Path $OutFile -Value ("[ALLOWED] {0}" -f $file.FullName)
+                            $counts.Allowed++
+                        }
                     }
                 } catch {
                     $counts.Errors++
-                    $msg = ("Error processing file {0}: {1}" -f $file.FullName, $_.Exception.Message)
+                    $msg = "Error processing file {0}: {1}" -f $file.FullName, $_.Exception.Message
                     Add-Content -Path $OutFile -Value $msg
                 }
             }
         } catch {
-            Write-Warning "Failed to recursively enumerate $rootPath : $_"
+            Write-Warning "Failed to enumerate $rootPath : $_"
             Add-Content -Path $OutFile -Value ("Failed to enumerate path {0}: {1}" -f $rootPath, $_.Exception.Message)
         }
     }
 
     # Summary
-    Add-Content -Path $OutFile -Value "`nSummary:`n"
+    Add-Content -Path $OutFile -Value "`n`nSUMMARY:`n"
     foreach ($k in $counts.Keys) {
-        $line = "{0,-12} : {1}" -f $k, $counts[$k]
+        $line = "{0,-15} : {1}" -f $k, $counts[$k]
         Add-Content -Path $OutFile -Value $line
     }
 
-    Write-Host "`nSearch Complete. Summary:" -ForegroundColor Magenta
-    $counts.GetEnumerator() | ForEach-Object { Write-Host ("{0,-12} : {1}" -f $_.Name, $_.Value) }
-    Write-Host "Full report saved to: $OutFile" -ForegroundColor Green
-    Write-Host "CRITICAL: Do NOT delete files unless you are 100% sure they are prohibited." -ForegroundColor White
+    Write-Host "`n`nScan Complete. Summary:" -ForegroundColor Magenta
+    $counts.GetEnumerator() | ForEach-Object { 
+        Write-Host ("{0,-15} : {1}" -f $_.Name, $_.Value) 
+    }
+    Write-Host "`nFull report saved to: $OutFile" -ForegroundColor Green
+    Write-Host "CRITICAL: Only delete files classified as [PROHIBITED]." -ForegroundColor White
 }
 
 # --- Main execution ---
-# Determine scan roots
 if ($ScanRoots -and $ScanRoots.Count -gt 0) {
     $finalScanRoots = $ScanRoots
 } else {
     $finalScanRoots = (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Free -ne $null } | ForEach-Object { $_.Root })
 }
 
+$allExcludePaths = @()
+if (-not $IncludeSystemFiles) {
+    $allExcludePaths += Get-SystemExclusionPaths
+}
+if ($ExcludePaths -and $ExcludePaths.Count -gt 0) {
+    $allExcludePaths += $ExcludePaths
+}
+$allExcludePaths = $allExcludePaths | Select-Object -Unique
+
 if ($Parallel) {
-    # Lightweight parallelization: run each root in a separate job (helps on machines with many cores)
     $jobs = @()
     foreach ($r in $finalScanRoots) {
         $j = Start-Job -ScriptBlock {
-            param($root,$extra,$excl,$out,$includeHidden)
-            Find-ProhibitedFiles -ScanRootsParam @($root) -ExtraPathsParam $extra -ExcludePathsParam $excl -OutFile $out -IncludeHiddenParam:$includeHidden
-        } -ArgumentList ($r,$ExtraPaths,$ExcludePaths,$ReportPath,$IncludeHidden.IsPresent)
+            param($root,$extra,$excl,$out,$includeHidden,$includeSysFiles)
+            Find-ProhibitedFiles -ScanRootsParam @($root) -ExtraPathsParam $extra -ExcludePathsParam $excl -OutFile $out -IncludeHiddenParam:$includeHidden -IncludeSystemFilesParam:$includeSysFiles
+        } -ArgumentList ($r,$ExtraPaths,$allExcludePaths,$ReportPath,$IncludeHidden.IsPresent,$IncludeSystemFiles.IsPresent)
         $jobs += $j
     }
     Write-Host "Started $($jobs.Count) jobs; waiting for completion..." -ForegroundColor Cyan
     Receive-Job -Job $jobs -Wait -AutoRemoveJob | Out-Null
 } else {
-    Find-ProhibitedFiles -ScanRootsParam $finalScanRoots -ExtraPathsParam $ExtraPaths -ExcludePathsParam $ExcludePaths -OutFile $ReportPath -IncludeHiddenParam:$IncludeHidden
+    Find-ProhibitedFiles -ScanRootsParam $finalScanRoots -ExtraPathsParam $ExtraPaths -ExcludePathsParam $allExcludePaths -OutFile $ReportPath -IncludeHiddenParam:$IncludeHidden -IncludeSystemFilesParam:$IncludeSystemFiles
 }
 
 Write-Host "`nDone." -ForegroundColor Green
