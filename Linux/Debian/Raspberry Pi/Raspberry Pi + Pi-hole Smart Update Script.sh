@@ -8,7 +8,7 @@ echo "Starting full system update..."
 
 # 1. Repairs broken packages
 echo "Fixing broken dependencies if any..."
-sudo apt install -f -y
+# sudo apt install -f -y
 sudo dpkg --configure -a
 echo "Broken dependencies fixed."
 
