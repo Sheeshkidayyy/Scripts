@@ -15,5 +15,4 @@ BOOM it should have helped you a bunch!
 
 
 Questions:
-How? Have they worked? Points?
-All scripts are made with AI so far. They all have worked and are all verified in competition. No scripts has lost me point yet 🤞
+How?: All scripts are made with AI so far. Have they worked?: They all have worked and are all verified in competition. Points?: No script has lost me point yet 🤞
