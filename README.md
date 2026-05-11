@@ -1,5 +1,5 @@
 # Scripts and Materials 
-Cyberpatriot XVIII-xxxx
+Cyberpatriot 2025-2026 XVIII-xxxx
 
 ## Instructions:
 Choose your operating system or distribution by clicking into the folder (Ex: Windows 11, Windows Server, Ubuntu Linux, Mint Linux)
