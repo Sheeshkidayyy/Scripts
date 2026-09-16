@@ -25,8 +25,14 @@ param(
     [switch]$Apply,
     [switch]$Yes,
     [switch]$CreateBaseline,
-    [string]$BaselinePath = (Join-Path $PSScriptRoot 'CYPat-WS2019-Baseline.json')
+    [string]$BaselinePath = ''
 )
+
+if ([string]::IsNullOrWhiteSpace($BaselinePath)) {
+    $baselineFolder = Get-Variable -Name PSScriptRoot -ValueOnly -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrWhiteSpace($baselineFolder)) { $baselineFolder = (Get-Location).Path }
+    $BaselinePath = Join-Path -Path $baselineFolder -ChildPath 'CYPat-WS2019-Baseline.json'
+}
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
@@ -40,6 +46,8 @@ if ($Apply -and -not $PSBoundParameters.ContainsKey('Confirm')) { $ConfirmPrefer
 $script:Mode = if ($Apply) { 'APPLY' } else { 'AUDIT' }
 $script:Review = [System.Collections.Generic.List[object]]::new()
 $script:Changes = [System.Collections.Generic.List[object]]::new()
+$script:Passed = 0
+$script:ServiceDecisions = [ordered]@{}
 
 function Write-Status {
     param([ValidateSet('OK','INFO','ORANGE','CHANGE')][string]$Kind, [string]$Message)
@@ -47,10 +55,9 @@ function Write-Status {
     Write-Host "[$(Get-Date -Format HH:mm:ss)][$Kind] $Message" -ForegroundColor $color
 }
 function Add-Review {
-    param([string]$Category,[string]$Item,[string]$Evidence,[string]$Question)
-    $entry = [pscustomobject]@{ Category=$Category; Item=$Item; Evidence=$Evidence; Question=$Question }
+    param([string]$Category,[string]$ReviewItem,[string]$ReviewEvidence,[string]$ReviewQuestion)
+    $entry = [pscustomobject]@{ Category=$Category; Item=$ReviewItem; Evidence=$ReviewEvidence; Question=$ReviewQuestion }
     $script:Review.Add($entry)
-    Write-Status ORANGE "$Category / $Item - $Evidence. $Question"
 }
 function Add-Change {
     param([string]$Item,[string]$Result)
@@ -73,7 +80,7 @@ function Invoke-GuardedChange {
 function Set-RegistryValue {
     param([string]$Category,[string]$Path,[string]$Name,[object]$Value,[ValidateSet('DWord','String')][string]$Type='DWord')
     $current = try { Get-ItemPropertyValue -LiteralPath $Path -Name $Name -ErrorAction Stop } catch { $null }
-    if ($current -eq $Value) { Write-Status OK "$Category / $Name is compliant"; return }
+    if ($current -eq $Value) { $script:Passed++; return }
     Add-Review $Category $Name "Current='$current'; expected='$Value'" 'Apply the approved baseline?'
     $p=$Path; $n=$Name; $v=$Value; $t=$Type
     Invoke-GuardedChange "$Category / $Name" {
@@ -102,8 +109,9 @@ function Invoke-ServiceDecision {
         if ((Get-ItemPropertyValue 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' 'fDenyTSConnections' -ErrorAction SilentlyContinue) -eq 0) {'enabled'} else {'disabled'}
     } else { ($services | ForEach-Object { "$($_.Name)=$($_.State)/$($_.StartMode)" }) -join '; ' }
     Add-Review 'Service decision' $Label "Current state: $state" "$Warning Choose whether this service should be enabled."
-    if (-not $Apply) { return }
     $enable = Read-YesNo "Should $Label be enabled"
+    $script:ServiceDecisions[$Label] = if ($enable) { 'Yes' } else { 'No' }
+    if (-not $Apply) { return }
     $actionText = if ($enable) { 'enable' } else { 'disable' }
     $rdpValue = if ($enable) { 0 } else { 1 }
     if ($Rdp) {
@@ -139,12 +147,16 @@ Write-Status INFO 'No accounts, groups, software, files, shares, certificates, f
 # Human account and group audit.
 Write-Status INFO '=== ACCOUNTS AND GROUPS ==='
 foreach ($user in Get-LocalUser -ErrorAction SilentlyContinue) {
-    $facts = "Enabled=$($user.Enabled); PasswordRequired=$($user.PasswordRequired); NeverExpires=$($user.PasswordNeverExpires); LastLogon=$($user.LastLogon)"
-    Add-Review 'Accounts' $user.Name $facts 'Is this account authorized?'
+    $neverExpiresProperty = $user.PSObject.Properties['PasswordNeverExpires']
+    $neverExpires = if ($neverExpiresProperty) { $neverExpiresProperty.Value } else { 'Unavailable' }
+    if ($user.Enabled -and ((-not $user.PasswordRequired) -or $neverExpires -eq $true -or $user.Name -eq 'Guest')) {
+        Add-Review 'Account exception' $user.Name "PasswordRequired=$($user.PasswordRequired); NeverExpires=$neverExpires" 'Verify this account is authorized and secured.'
+    }
 }
 foreach ($group in 'Administrators','Remote Desktop Users','Backup Operators','Server Operators','Account Operators','Print Operators') {
-    foreach ($member in Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue) {
-        Add-Review 'Privileged group' "${group}: $($member.Name)" "Type=$($member.ObjectClass)" 'Is this membership authorized?'
+    $members = @(Get-LocalGroupMember -Group $group -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    if ($members.Count) {
+        Add-Review 'Privileged group' $group ($members -join ', ') 'Verify these memberships against the scenario.'
     }
 }
 if ((Get-CimInstance Win32_ComputerSystem).DomainRole -ge 4 -and (Get-Command Get-ADUser -ErrorAction SilentlyContinue)) {
@@ -187,19 +199,24 @@ foreach($item in $registryBaseline){ Set-RegistryValue $item[0] $item[1] $item[2
 # Audit policy, firewall, remote management, and SMB.
 Write-Status INFO '=== NETWORK, FIREWALL, SMB, AND WINRM ==='
 foreach($sub in 'Logon','Account Lockout','User Account Management','Security Group Management','Process Creation','Audit Policy Change','Sensitive Privilege Use','System Integrity') {
-    Add-Review 'Advanced audit policy' $sub ((auditpol.exe /get /subcategory:"$sub" /r 2>$null | Out-String).Trim()) 'Does this success/failure coverage meet the scenario requirement?'
+    $auditState = (auditpol.exe /get /subcategory:"$sub" /r 2>$null | Out-String).Trim()
+    if ($auditState -match 'No Auditing') { Add-Review 'Advanced audit policy' $sub $auditState 'Enable the required success/failure auditing.' } else { $script:Passed++ }
 }
 foreach($profile in Get-NetFirewallProfile -ErrorAction SilentlyContinue){
     if(-not $profile.Enabled -or $profile.DefaultInboundAction -ne 'Block'){
         Add-Review 'Firewall' $profile.Name "Enabled=$($profile.Enabled); Inbound=$($profile.DefaultInboundAction)" 'Apply enabled firewall with default inbound block?'
         $name=$profile.Name
         Invoke-GuardedChange "Firewall $name" { Set-NetFirewallProfile -Profile $name -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Allow -LogBlocked True -ErrorAction Stop } { (Get-NetFirewallProfile -Name $name).Enabled }
-    } else { Write-Status OK "Firewall $($profile.Name) is enabled with inbound block" }
+    } else { $script:Passed++ }
 }
 Get-NetFirewallRule -Enabled True -Direction Inbound -Action Allow -ErrorAction SilentlyContinue | ForEach-Object {
     $port=$_ | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
     $addr=$_ | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-    Add-Review 'Firewall allow rule' $_.DisplayName "Protocol=$($port.Protocol -join ','); Port=$($port.LocalPort -join ','); Remote=$($addr.RemoteAddress -join ',')" 'Is this rule required?'
+    $ports = @($port.LocalPort)
+    $risky = @('Any',21,23,25,69,110,135,137,138,139,161,162,445,3389,5900,5985,5986)
+    if (($ports | Where-Object { $_ -in $risky }) -or (@($addr.RemoteAddress) -contains 'Any' -and $ports -contains 'Any')) {
+        Add-Review 'Firewall allow rule' $_.DisplayName "Protocol=$($port.Protocol -join ','); Port=$($ports -join ','); Remote=$($addr.RemoteAddress -join ',')" 'Verify this exposed rule is required.'
+    }
 }
 try {
     $smb=Get-SmbServerConfiguration
@@ -217,7 +234,7 @@ try {
     $winrm | ForEach-Object { Add-Review 'WinRM authentication' $_.Name "Enabled=$($_.Value)" 'Is this authentication method required?' }
     $trusted=(Get-Item WSMan:\localhost\Client\TrustedHosts -ErrorAction SilentlyContinue).Value
     if($trusted){ Add-Review 'WinRM' 'TrustedHosts' $trusted 'Is every trusted host required?' }
-} catch { Add-Review 'WinRM' 'Audit unavailable' $_.Exception.Message 'Review remoting manually.' }
+} catch { Write-Status INFO 'WinRM is not configured; no listener audit is needed.' }
 
 # Browser hardening. Firefox policies are only written when Firefox is installed.
 Write-Status INFO '=== BROWSER SECURITY ==='
@@ -248,14 +265,15 @@ if($firefoxExe){
 Write-Status INFO '=== DEFENDER, PLATFORM, AND UPDATE AUDIT ==='
 try{
     $mp=Get-MpComputerStatus
-    Add-Review 'Defender' 'Protection state' "AV=$($mp.AntivirusEnabled); RTP=$($mp.RealTimeProtectionEnabled); Behavior=$($mp.BehaviorMonitorEnabled); Signature=$($mp.AntivirusSignatureLastUpdated)" 'Does Defender meet the scenario requirement?'
+    if (-not $mp.AntivirusEnabled -or -not $mp.RealTimeProtectionEnabled -or -not $mp.BehaviorMonitorEnabled) {
+        Add-Review 'Defender' 'Protection state' "AV=$($mp.AntivirusEnabled); RTP=$($mp.RealTimeProtectionEnabled); Behavior=$($mp.BehaviorMonitorEnabled)" 'Restore approved Defender protection.'
+    } else { $script:Passed++ }
     $pref=Get-MpPreference
     foreach($path in @($pref.ExclusionPath)){Add-Review 'Defender exclusion' $path 'Configured exclusion path' 'Is this exclusion authorized?'}
 }catch{Add-Review 'Defender' 'Unavailable' $_.Exception.Message 'Verify approved antivirus protection manually.'}
-try{Get-AppLockerPolicy -Effective -ErrorAction Stop | Out-Null; Add-Review 'AppLocker/WDAC' 'AppLocker policy' 'Effective policy was read.' 'Review enforcement and audit-mode rules.'}catch{Add-Review 'AppLocker/WDAC' 'Policy unavailable' $_.Exception.Message 'Audit AppLocker and WDAC manually.'}
-try{Get-CimInstance Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard -ErrorAction Stop | ForEach-Object{Add-Review 'WDAC/Device Guard' 'Status' "VBS=$($_.VirtualizationBasedSecurityStatus); Running=$($_.SecurityServicesRunning -join ',')" 'Review only; do not enable without compatibility testing.'}}catch{Write-Status INFO 'Device Guard audit unavailable.'}
+try{Get-AppLockerPolicy -Effective -ErrorAction Stop | Out-Null; $script:Passed++}catch{Add-Review 'AppLocker/WDAC' 'Policy unavailable' $_.Exception.Message 'Audit AppLocker and WDAC manually.'}
 $wu=Get-Service wuauserv -ErrorAction SilentlyContinue
-if($wu){Add-Review 'Updates' 'Windows Update service' "State=$($wu.Status); StartType=$($wu.StartType)" 'Audit only: do not install updates unless the round instructions permit it.'}
+if($wu){$script:Passed++}
 
 # Interactive service state decisions occur last so all audit evidence is visible first.
 Write-Status INFO '=== SERVICE DECISIONS ==='
@@ -285,11 +303,15 @@ if($CreateBaseline){
             if(($before -join '') -ne ($after -join '')){Add-Review 'Baseline difference' $field 'Current state differs from the saved baseline.' 'Review differences before changing anything.'}
         }
     }catch{Add-Review 'Baseline' 'Comparison failed' $_.Exception.Message 'Recreate the baseline from a known-good image.'}
-}else{Add-Review 'Baseline' 'No baseline found' "Expected $BaselinePath" 'After validating this image, rerun with -CreateBaseline.'}
+}else{Write-Status INFO "No baseline found. Create one later with -CreateBaseline: $BaselinePath"}
 
-Write-Host "`n================ ORANGE HUMAN REVIEW LIST ================" -ForegroundColor DarkYellow
-if($script:Review.Count -eq 0){Write-Status OK 'No review items were recorded.'}
-else{$script:Review|ForEach-Object{Write-Host "[ORANGE] $($_.Category) / $($_.Item): $($_.Evidence) -- $($_.Question)" -ForegroundColor DarkYellow}}
-Write-Host "============================================================" -ForegroundColor DarkYellow
-Write-Host "Completed in $script:Mode mode. Changes applied: $($script:Changes.Count). Review items: $($script:Review.Count)." -ForegroundColor Cyan
+Write-Host "`n================ SUMMARY ================" -ForegroundColor Cyan
+Write-Host "PASSED: $($script:Passed)  CHANGED: $($script:Changes.Count)  REVIEW: $($script:Review.Count)" -ForegroundColor Cyan
+Write-Host 'SERVICE DECISIONS:' -ForegroundColor Cyan
+$script:ServiceDecisions.GetEnumerator() | ForEach-Object { Write-Host "  $($_.Key): $($_.Value)" -ForegroundColor Cyan }
+if($script:Review.Count){
+    Write-Host 'FAILURES / HUMAN REVIEW:' -ForegroundColor DarkYellow
+    $script:Review | ForEach-Object { Write-Host "  [ORANGE] $($_.Category): $($_.Item) - $($_.Evidence)" -ForegroundColor DarkYellow }
+}
+Write-Host "Completed in $script:Mode mode." -ForegroundColor Cyan
 
